@@ -1,0 +1,135 @@
+name: Check Node.js Version
+
+on:
+  workflow_call:
+    inputs:
+      nvmrc_path:
+        description: 'Path to .nvmrc file'
+        type: string
+        default: '.nvmrc'
+      issue_label:
+        description: 'Label to apply to created issues'
+        type: string
+        default: 'node-version-update'
+
+permissions:
+  issues: write
+  contents: read
+
+jobs:
+  check-node-version:
+    name: Check for new Node.js LTS
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Get current Node version
+        id: current
+        env:
+          NVMRC_PATH: ${{ inputs.nvmrc_path }}
+        run: |
+          CURRENT_VERSION=$(cat "$NVMRC_PATH" | tr -d '\n')
+          echo "version=$CURRENT_VERSION" >> $GITHUB_OUTPUT
+          echo "Current Node version: $CURRENT_VERSION"
+
+      - name: Get latest Node LTS version
+        id: latest
+        run: |
+          LATEST_LTS=$(curl -s https://nodejs.org/dist/index.json | \
+            jq -r '[.[] | select(.lts != false)] | .[0].version' | \
+            sed 's/v//' | cut -d. -f1)
+          echo "version=$LATEST_LTS" >> $GITHUB_OUTPUT
+          echo "Latest Node LTS major version: $LATEST_LTS"
+
+      - name: Check AWS Lambda runtime availability
+        id: lambda-check
+        env:
+          LATEST_VERSION: ${{ steps.latest.outputs.version }}
+        run: |
+          RUNTIME_NAME="nodejs${LATEST_VERSION}.x"
+          RUNTIMES_JSON=$(curl -s https://raw.githubusercontent.com/aws/aws-sdk-js/master/apis/lambda-2015-03-31.normal.json)
+          CDK_RUNTIME_FILE=$(curl -s https://raw.githubusercontent.com/aws/aws-cdk/main/packages/aws-cdk-lib/aws-lambda/lib/runtime.ts)
+
+          if echo "$RUNTIMES_JSON" | grep -q "\"$RUNTIME_NAME\"" || \
+             echo "$CDK_RUNTIME_FILE" | grep -qi "NODEJS_${LATEST_VERSION}_X"; then
+            echo "available=true" >> $GITHUB_OUTPUT
+            echo "✅ Lambda runtime $RUNTIME_NAME is available"
+          else
+            echo "available=false" >> $GITHUB_OUTPUT
+            echo "⚠️  Lambda runtime $RUNTIME_NAME is not yet available"
+          fi
+          echo "runtime_name=$RUNTIME_NAME" >> $GITHUB_OUTPUT
+
+      - name: Compare versions
+        id: compare
+        env:
+          CURRENT: ${{ steps.current.outputs.version }}
+          LATEST: ${{ steps.latest.outputs.version }}
+          LAMBDA_AVAILABLE: ${{ steps.lambda-check.outputs.available }}
+        run: |
+          if [ "$CURRENT" != "$LATEST" ] && [ "$LAMBDA_AVAILABLE" = "true" ]; then
+            echo "update_needed=true" >> $GITHUB_OUTPUT
+            echo "⚠️  Update available AND Lambda runtime ready: $CURRENT → $LATEST"
+          elif [ "$CURRENT" != "$LATEST" ] && [ "$LAMBDA_AVAILABLE" = "false" ]; then
+            echo "update_needed=false" >> $GITHUB_OUTPUT
+            echo "ℹ️  Node.js $LATEST available, but Lambda runtime not yet supported"
+          else
+            echo "update_needed=false" >> $GITHUB_OUTPUT
+            echo "✅ Node.js is up to date"
+          fi
+
+      - name: Create issue for Node update
+        if: steps.compare.outputs.update_needed == 'true'
+        uses: actions/github-script@v7
+        env:
+          CURRENT_VERSION: ${{ steps.current.outputs.version }}
+          LATEST_VERSION: ${{ steps.latest.outputs.version }}
+          RUNTIME_NAME: ${{ steps.lambda-check.outputs.runtime_name }}
+          ISSUE_LABEL: ${{ inputs.issue_label }}
+        with:
+          script: |
+            const currentVersion = process.env.CURRENT_VERSION;
+            const latestVersion = process.env.LATEST_VERSION;
+            const runtimeName = process.env.RUNTIME_NAME;
+            const issueLabel = process.env.ISSUE_LABEL;
+
+            const title = `Update Node.js runtime from ${currentVersion} to ${latestVersion}`;
+
+            const { data: existingIssues } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: issueLabel,
+            });
+
+            if (existingIssues.some(i => i.title.includes(`${currentVersion} to ${latestVersion}`))) {
+              core.info('ℹ️  Issue already exists for this update');
+              return;
+            }
+
+            const body = [
+              '## Node.js LTS Update Available',
+              '',
+              `A new Node.js LTS version is available and supported in AWS Lambda:`,
+              `- **Current**: ${currentVersion}`,
+              `- **Latest LTS**: ${latestVersion}`,
+              `- **Lambda runtime**: \`${runtimeName}\``,
+              '',
+              '## Checklist',
+              '- [ ] Update `.nvmrc`',
+              '- [ ] Update `package.json` engines field',
+              '- [ ] Update `runtime: lambda.Runtime.NODEJS_${latestVersion}_X` in CDK stack',
+              '- [ ] Update runtime assertions in tests',
+              '- [ ] Run `npm test` locally',
+              '- [ ] Deploy and verify',
+            ].join('\n');
+
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title,
+              body,
+              labels: [issueLabel, 'enhancement'],
+            });
+            core.info('✅ Created issue for Node.js update');

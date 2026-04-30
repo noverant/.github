@@ -1,0 +1,159 @@
+name: Check Python Version
+
+on:
+  workflow_call:
+    inputs:
+      python_version_file:
+        description: 'Path to file containing current Python version (e.g. .python-version)'
+        type: string
+        default: '.python-version'
+      issue_label:
+        description: 'Label to apply to created issues'
+        type: string
+        default: 'python-version-update'
+
+permissions:
+  issues: write
+  contents: read
+
+jobs:
+  check-python-version:
+    name: Check for new Python Lambda runtime
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Get current Python version
+        id: current
+        env:
+          VERSION_FILE: ${{ inputs.python_version_file }}
+        run: |
+          CURRENT_VERSION=$(cat "$VERSION_FILE" | tr -d '\n')
+          echo "version=$CURRENT_VERSION" >> $GITHUB_OUTPUT
+          echo "Current Python version: $CURRENT_VERSION"
+
+      - name: Get latest Lambda-supported Python version
+        id: latest
+        run: |
+          # CDK runtime.ts is the source of truth for what Lambda actually supports
+          CDK_RUNTIME_FILE=$(curl -s https://raw.githubusercontent.com/aws/aws-cdk/main/packages/aws-cdk-lib/aws-lambda/lib/runtime.ts)
+          LATEST_MINOR=$(echo "$CDK_RUNTIME_FILE" | grep -oP 'PYTHON_3_\K[0-9]+' | sort -n | tail -1)
+
+          if [ -z "$LATEST_MINOR" ]; then
+            echo "version=unknown" >> $GITHUB_OUTPUT
+            echo "⚠️  Could not determine latest Lambda Python version from CDK"
+          else
+            echo "version=3.${LATEST_MINOR}" >> $GITHUB_OUTPUT
+            echo "Latest Lambda-supported Python: 3.${LATEST_MINOR}"
+          fi
+
+      - name: Check EOL status of current version
+        id: eol-check
+        env:
+          CURRENT_VERSION: ${{ steps.current.outputs.version }}
+        run: |
+          EOL_DATA=$(curl -s "https://endoflife.date/api/python/${CURRENT_VERSION}.json" 2>/dev/null || echo "{}")
+          EOL_DATE=$(echo "$EOL_DATA" | jq -r '.eol // "unknown"')
+          echo "eol_date=$EOL_DATE" >> $GITHUB_OUTPUT
+          echo "EOL date for Python ${CURRENT_VERSION}: $EOL_DATE"
+
+          # Warn if EOL is within 6 months or already past
+          if [ "$EOL_DATE" != "unknown" ] && [ "$EOL_DATE" != "null" ]; then
+            EOL_EPOCH=$(date -d "$EOL_DATE" +%s 2>/dev/null || date -j -f "%Y-%m-%d" "$EOL_DATE" +%s 2>/dev/null || echo "0")
+            NOW_EPOCH=$(date +%s)
+            SIX_MONTHS=$((60 * 60 * 24 * 180))
+            if [ "$EOL_EPOCH" -lt "$((NOW_EPOCH + SIX_MONTHS))" ]; then
+              echo "approaching_eol=true" >> $GITHUB_OUTPUT
+              echo "⚠️  Python ${CURRENT_VERSION} reaches EOL on ${EOL_DATE}"
+            else
+              echo "approaching_eol=false" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "approaching_eol=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Compare versions
+        id: compare
+        env:
+          CURRENT: ${{ steps.current.outputs.version }}
+          LATEST: ${{ steps.latest.outputs.version }}
+          APPROACHING_EOL: ${{ steps.eol-check.outputs.approaching_eol }}
+          EOL_DATE: ${{ steps.eol-check.outputs.eol_date }}
+        run: |
+          if [ "$LATEST" = "unknown" ]; then
+            echo "update_needed=false" >> $GITHUB_OUTPUT
+          elif [ "$CURRENT" != "$LATEST" ]; then
+            echo "update_needed=true" >> $GITHUB_OUTPUT
+            if [ "$APPROACHING_EOL" = "true" ]; then
+              echo "update_reason=newer runtime available; EOL approaching on ${EOL_DATE}" >> $GITHUB_OUTPUT
+            else
+              echo "update_reason=newer Lambda runtime available" >> $GITHUB_OUTPUT
+            fi
+            echo "⚠️  Update available: $CURRENT → $LATEST"
+          else
+            echo "update_needed=false" >> $GITHUB_OUTPUT
+            echo "✅ Python runtime is up to date"
+          fi
+
+      - name: Create issue for Python update
+        if: steps.compare.outputs.update_needed == 'true'
+        uses: actions/github-script@v7
+        env:
+          CURRENT_VERSION: ${{ steps.current.outputs.version }}
+          LATEST_VERSION: ${{ steps.latest.outputs.version }}
+          EOL_DATE: ${{ steps.eol-check.outputs.eol_date }}
+          UPDATE_REASON: ${{ steps.compare.outputs.update_reason }}
+          ISSUE_LABEL: ${{ inputs.issue_label }}
+        with:
+          script: |
+            const currentVersion = process.env.CURRENT_VERSION;
+            const latestVersion = process.env.LATEST_VERSION;
+            const eolDate = process.env.EOL_DATE;
+            const updateReason = process.env.UPDATE_REASON;
+            const issueLabel = process.env.ISSUE_LABEL;
+
+            const title = `Update Python runtime from ${currentVersion} to ${latestVersion}`;
+
+            const { data: existingIssues } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: issueLabel,
+            });
+
+            if (existingIssues.some(i => i.title.includes(`${currentVersion} to ${latestVersion}`))) {
+              core.info('ℹ️  Issue already exists for this update');
+              return;
+            }
+
+            const eolLine = eolDate && eolDate !== 'unknown'
+              ? `- **Python ${currentVersion} EOL**: ${eolDate}`
+              : '';
+
+            const body = [
+              '## Python Runtime Update Available',
+              '',
+              `Reason: ${updateReason}`,
+              '',
+              `- **Current**: Python ${currentVersion}`,
+              `- **Latest Lambda-supported**: Python ${latestVersion}`,
+              eolLine,
+              '',
+              '## Checklist',
+              `- [ ] Update \`.python-version\` to \`${latestVersion}\``,
+              '- [ ] Update `python-version` in GitHub Actions workflows',
+              '- [ ] Update `PYTHON_3_X` runtime constant in CDK stack',
+              '- [ ] Update `compatible_runtimes` in any Lambda layer definitions',
+              '- [ ] Test locally',
+              '- [ ] Deploy and verify',
+            ].filter(Boolean).join('\n');
+
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title,
+              body,
+              labels: [issueLabel, 'enhancement'],
+            });
+            core.info('✅ Created issue for Python update');
