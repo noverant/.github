@@ -1,0 +1,11 @@
+version: 2
+updates:
+  # Keeps the SHA pins in the shared workflows current. No automerge: other
+  # repos call these workflows, so a person reviews each update.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    cooldown:
+      default-days: 7

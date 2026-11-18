@@ -22,7 +22,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Get current Node version
         id: current
@@ -81,7 +81,7 @@ jobs:
 
       - name: Create issue for Node update
         if: steps.compare.outputs.update_needed == 'true'
-        uses: actions/github-script@v7
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
         env:
           CURRENT_VERSION: ${{ steps.current.outputs.version }}
           LATEST_VERSION: ${{ steps.latest.outputs.version }}
